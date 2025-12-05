@@ -1,29 +1,45 @@
 from bs4 import BeautifulSoup
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import os
+from html import escape
 import requests
+import sqlite3
+from typing import Optional
 from xml.etree import ElementTree as ET
 
 @dataclass
 class Article:
-    img: str
+    img: Optional[str]
     title: str
     link: str
+    body: Optional[str]
 
 base_url = "https://watchufa.com/league/news"
+dbfile = ".etag.db"
 
-def read_etag() -> str:
-    if os.path.isfile(".etag"):
-        with open(".etag", 'r') as f:
-            etag = f.read()
-        return etag
-    else:
-        return ""
+def read_etag() -> dict:
+    con = sqlite3.connect(dbfile)
+    cur = con.cursor()
 
-def write_etag(etag: str):
-    with open(".etag", "w") as f:
-        f.write(etag)
+    res = cur.execute("SELECT name FROM sqlite_master where name='etag'")
+    if res.fetchone() is None:
+        cur.execute("CREATE TABLE etag(url TEXT PRIMARY KEY,tag TEXT)")
+
+    res = cur.execute("SELECT url,tag from etag")
+    tags = dict(res.fetchall())
+
+    con.close()
+    return tags
+
+def write_etag(tags: dict):
+    con = sqlite3.connect(dbfile)
+    cur = con.cursor()
+    values = [(url, tags[url]) for url in tags]
+    sql = "INSERT INTO etag (url,tag) VALUES(?,?)" \
+        "ON CONFLICT DO UPDATE SET tag=excluded.tag"
+    cur.executemany(sql, values)
+    con.commit()
+    con.close()
 
 def get_links(body: bytes) -> list[Article]:
     soup = BeautifulSoup(body, "html.parser")
@@ -35,7 +51,7 @@ def get_links(body: bytes) -> list[Article]:
         link = article.select_one(".views-field-title a")
         title = link.text
         url = f"https://watchufa.com{link['href']}"
-        articles.append(Article(img=img, title=title, link=url))
+        articles.append(Article(img=img, title=title, link=url, body=None))
     return articles
 
 def write_rss(articles: list[Article], last_mod: str) -> ET.ElementTree:
@@ -73,15 +89,20 @@ def write_rss(articles: list[Article], last_mod: str) -> ET.ElementTree:
         link_child = ET.SubElement(item, 'link')
         link_child.text = article.link
 
+        if article.body is not None:
+            description_child = ET.SubElement(item, 'description')
+            description_child.text = escape(article.body)
+
     return ET.ElementTree(root)
 
 if __name__ == '__main__':
-    etag = read_etag()
+    etags = read_etag()
     response = requests.head(base_url)
-    if response.headers['Etag'] == etag:
+    if base_url in etags and response.headers['Etag'] == etags[base_url]:
         exit(201)
     else:
-        write_etag(response.headers['Etag'])
+        etags[base_url] = response.headers['Etag']
+        write_etag(etags)
 
     response = requests.get(base_url)
     last_mod = response.headers['Last-Modified']
