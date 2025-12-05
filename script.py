@@ -34,7 +34,7 @@ def get_links(body: bytes) -> list[Article]:
             img = img["src"]
         link = article.select_one(".views-field-title a")
         title = link.text
-        url = base_url + link['href']
+        url = f"https://watchufa.com{link['href']}"
         articles.append(Article(img=img, title=title, link=url))
     return articles
 
