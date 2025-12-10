@@ -2,8 +2,10 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 from html import escape
 import requests
+from requests.adapters import HTTPAdapter
 import sqlite3
 from time import sleep
+from urllib3.util import Retry
 from xml.etree import ElementTree as ET
 
 
@@ -11,6 +13,11 @@ base_url = "https://watchufa.com/league/news"
 dbfile = ".etag.db"
 rfc822 = "%a, %d %b %Y %H:%M:%S %z"
 
+retry_strat = Retry(total=5)
+adapter = HTTPAdapter(max_retries=retry_strat)
+session = requests.Session()
+session.mount("http://", adapter)
+session.mount("https://", adapter)
 
 def read_etags() -> dict:
     con = sqlite3.connect(dbfile)
@@ -20,8 +27,13 @@ def read_etags() -> dict:
     if res.fetchone() is None:
         cur.execute("CREATE TABLE etag(url TEXT PRIMARY KEY,tag TEXT,body TEXT)")
 
-    res = cur.execute("SELECT url,tag from etag")
-    tags = dict(res.fetchall())
+    res = cur.execute("SELECT url,tag,body from etag")
+    tags = dict()
+    while True:
+        r = res.fetchone()
+        if r is None:
+            break
+        tags[r[0]] = (r[1], r[2])
 
     con.close()
     return tags
@@ -52,14 +64,14 @@ def get_links(body: bytes) -> list[dict]:
     return articles
 
 def get_body(article: dict):
-    response = requests.head(article['link'])
+    print(f"HEAD {article['link']}")
+    response = session.head(article['link'])
 
     if 'etag' in article and 'body' in article and response.headers['Etag'] == article['etag']:
         return
 
-    sleep(1)
+    response = get_with_backoff(article['link'])
 
-    response = requests.get(article['link'])
     article['etag'] = response.headers['Etag']
     article['date'] = response.headers['Last-Modified']
 
@@ -117,22 +129,36 @@ def write_rss(articles: list[dict], last_mod: str) -> ET.ElementTree:
 
     return ET.ElementTree(root)
 
+def get_with_backoff(url):
+    retries = 0
+    while retries < 5:
+        print(f"GET {url}")
+        response = session.get(url)
+        if response.status_code == 200:
+            return response
+        else:
+            sleep(1 + (2 ** retries))
+            retries = retries + 1
+
+    raise
+
 if __name__ == '__main__':
     old_etags = read_etags()
-    response = requests.head(base_url)
-    if base_url in old_etags and response.headers['Etag'] == old_etags[base_url]:
-        exit(201)
-
+    print(f"HEAD {base_url}")
+    response = session.head(base_url)
     base_etag = response.headers['Etag']
 
-    response = requests.get(base_url)
+    if base_url in old_etags and base_etag == old_etags[base_url][0]:
+        exit(201)
+
+    response = get_with_backoff(base_url)
     last_mod = response.headers['Last-Modified']
     articles = get_links(response.content)
 
     for article in articles:
         if article['link'] in old_etags:
-            article['etag'] = old_etags[article['link']]
-            article['body'] = old_etags[article['body']]
+            article['etag'] = old_etags[article['link']][0]
+            article['body'] = old_etags[article['link']][1]
 
         get_body(article)
 
