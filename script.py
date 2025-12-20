@@ -1,10 +1,13 @@
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
+from dateutil import parser
 from html import escape
 import requests
 from requests.adapters import HTTPAdapter
+from requests.models import Response
 import sqlite3
 from time import sleep
+from typing import Optional
 from urllib3.util import Retry
 from xml.etree import ElementTree as ET
 
@@ -19,21 +22,25 @@ session = requests.Session()
 session.mount("http://", adapter)
 session.mount("https://", adapter)
 
+def dict_factory(cursor, row):
+    fields = [column[0] for column in cursor.description]
+    return {key: value for key, value in zip(fields, row)}
+
 def read_etags() -> dict:
     con = sqlite3.connect(dbfile)
+    con.row_factory = dict_factory
     cur = con.cursor()
 
     res = cur.execute("SELECT name FROM sqlite_master where name='etag'")
     if res.fetchone() is None:
-        cur.execute("CREATE TABLE etag(url TEXT PRIMARY KEY,tag TEXT,body TEXT)")
+        cur.execute("CREATE TABLE etag(link TEXT PRIMARY KEY,etag TEXT,date INTEGER,body TEXT)")
 
-    res = cur.execute("SELECT url,tag,body from etag")
+    res = cur.execute("SELECT link,etag,date,body from etag")
     tags = dict()
-    while True:
-        r = res.fetchone()
-        if r is None:
-            break
-        tags[r[0]] = (r[1], r[2])
+    while (r := res.fetchone()) is not None:
+        if r['date'] != '':
+            r['date'] = datetime.fromtimestamp(r['date'], timezone.utc).strftime(rfc822)
+        tags[r['link']] = r
 
     con.close()
     return tags
@@ -41,8 +48,13 @@ def read_etags() -> dict:
 def write_etags(values: list[dict]):
     con = sqlite3.connect(dbfile)
     cur = con.cursor()
-    sql = "INSERT INTO etag (url,tag,body) VALUES(:url,:tag,:body) " \
-        "ON CONFLICT DO UPDATE SET tag=excluded.tag,body=excluded.body"
+
+    for val in values:
+        if 'date' in val:
+            val['date'] = int(parser.parse(val['date']).timestamp())
+
+    sql = "INSERT INTO etag (link,etag,date,body) VALUES(:link,:etag,:date,:body) " \
+        "ON CONFLICT DO UPDATE SET etag=excluded.etag,date=excluded.date,body=excluded.body"
     cur.executemany(sql, values)
     con.commit()
     con.close()
@@ -55,7 +67,7 @@ def get_links(body: bytes) -> list[dict]:
         link = article.select_one(".views-field-title a")
         a = {
             "title": link.text,
-            "link": f"https://watchufa.com{link['href']}"
+            "link": f"https://watchufa.com{link['href']}",
         }
         if img is not None:
             a['img'] = img['src']
@@ -63,14 +75,23 @@ def get_links(body: bytes) -> list[dict]:
 
     return articles
 
-def get_body(article: dict):
-    print(f"HEAD {article['link']}")
-    response = session.head(article['link'])
+def get_body(article: dict) -> None:
+    """
+    Makes a web request to pull the body of an article. If `article['body']` and `article['etag']` are both present,
+    it will pass the ETag along in the headers, and if the response is 304 NOT MODIFIED, takes no action and makes
+    no further changes. If the response is 200 OK, the 'etag', 'date', and 'body' fields will be updated with the
+    newly-downloaded data.
 
-    if 'etag' in article and 'body' in article and response.headers['Etag'] == article['etag']:
+    :param article: A dict containing (at least) 'link'
+    """
+
+    etag = None
+    if 'body' in article and article['body'] is not None and 'etag' in article:
+        etag = article['etag']
+
+    response = get_with_backoff(article['link'], etag)
+    if response is None:
         return
-
-    response = get_with_backoff(article['link'])
 
     article['etag'] = response.headers['Etag']
     article['date'] = response.headers['Last-Modified']
@@ -129,14 +150,26 @@ def write_rss(articles: list[dict], last_mod: str) -> ET.ElementTree:
 
     return ET.ElementTree(root)
 
-def get_with_backoff(url):
+def get_with_backoff(url:str, etag:Optional[str]=None) -> Optional[Response]:
+    headers = {}
+    msg = f"GET {url}"
+    if etag is not None and etag != '':
+        headers['If-None-Match'] = etag
+        msg += f", {etag}"
+
     retries = 0
     while retries < 5:
-        print(f"GET {url}")
-        response = session.get(url)
-        if response.status_code == 200:
-            return response
-        else:
+        try:
+            response = session.get(url, headers=headers)
+            print(f"{msg} -> {response.status_code}")
+            if response.status_code == 304: # Not Modified
+                return None
+            elif response.status_code == 200: # OK
+                return response
+            else:
+                sleep(1 + (2 ** retries))
+                retries = retries + 1
+        except ConnectionError:
             sleep(1 + (2 ** retries))
             retries = retries + 1
 
@@ -144,30 +177,33 @@ def get_with_backoff(url):
 
 if __name__ == '__main__':
     old_etags = read_etags()
-    print(f"HEAD {base_url}")
-    response = session.head(base_url)
+
+    etag = None
+    if base_url in old_etags:
+        etag = old_etags[base_url]['etag']
+
+    response = get_with_backoff(base_url, etag)
+    if response is None:
+        exit(0)
+
     base_etag = response.headers['Etag']
-
-    if base_url in old_etags and base_etag == old_etags[base_url][0]:
-        exit(201)
-
-    response = get_with_backoff(base_url)
     last_mod = response.headers['Last-Modified']
+
     articles = get_links(response.content)
 
     for article in articles:
         if article['link'] in old_etags:
-            article['etag'] = old_etags[article['link']][0]
-            article['body'] = old_etags[article['link']][1]
+            for key in old_etags[article['link']]:
+                article[key] = old_etags[article['link']][key]
 
         get_body(article)
 
     doc = write_rss(articles, last_mod)
     doc.write("watchufa.rss", encoding="utf-8")
 
-    new_etags = [{'url': base_url, 'tag': base_etag, 'body': ''}]
+    new_etags = [{'link': base_url, 'etag': base_etag, 'date': last_mod, 'body': ''}]
     for article in articles:
-        new_etags.append({'url': article['link'], 'tag': article['etag'], 'body': article['body']})
+        new_etags.append(article)
     write_etags(new_etags)
 
     exit(0)
