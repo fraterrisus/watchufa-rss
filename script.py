@@ -140,11 +140,11 @@ def write_rss(articles: list[dict], last_mod: str) -> ET.ElementTree:
         link_child = ET.SubElement(item, 'link')
         link_child.text = article['link']
 
-        if article['date'] is not None:
+        if 'date' in article and article['date'] is not None:
             pub_date_child = ET.SubElement(item, 'pubDate')
             pub_date_child.text = article['date']
 
-        if article['body'] is not None:
+        if 'body' in article and article['body'] is not None:
             description_child = ET.SubElement(item, 'description')
             description_child.text = article['body']
 
