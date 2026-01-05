@@ -68,6 +68,7 @@ def get_links(body: bytes) -> list[dict]:
         a = {
             "title": link.text,
             "link": f"https://watchufa.com{link['href']}",
+            "body": "",
         }
         if img is not None:
             a['img'] = img['src']
