@@ -2,6 +2,7 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 from dateutil import parser
 from html import escape
+import logging.handlers
 import requests
 from requests.adapters import HTTPAdapter
 from requests.models import Response
@@ -15,6 +16,17 @@ from xml.etree import ElementTree as ET
 base_url = "https://watchufa.com/league/news"
 dbfile = ".etag.db"
 rfc822 = "%a, %d %b %Y %H:%M:%S %z"
+
+logger = logging.getLogger("watchufa")
+logger.setLevel(logging.DEBUG)
+log_handler = logging.handlers.RotatingFileHandler(
+    "watchufa.log",
+    maxBytes=1024 * 1024,
+    backupCount=5
+)
+log_formatter = logging.Formatter('{asctime} {name} {levelname:8s} {message}', style='{')
+log_handler.setFormatter(log_formatter)
+logger.addHandler(log_handler)
 
 retry_strat = Retry(total=5)
 adapter = HTTPAdapter(max_retries=retry_strat)
@@ -153,16 +165,17 @@ def write_rss(articles: list[dict], last_mod: str) -> ET.ElementTree:
 
 def get_with_backoff(url:str, etag:Optional[str]=None) -> Optional[Response]:
     headers = {}
-    msg = f"GET {url}"
+    msg = f"GET ({url}"
     if etag is not None and etag != '':
         headers['If-None-Match'] = etag
         msg += f", {etag}"
+    msg += ")"
 
     retries = 0
     while retries < 5:
         try:
             response = session.get(url, headers=headers)
-            print(f"{msg} -> {response.status_code}")
+            logger.info(f"{msg} -> {response.status_code}")
             if response.status_code == 304: # Not Modified
                 return None
             elif response.status_code == 200: # OK
@@ -171,12 +184,14 @@ def get_with_backoff(url:str, etag:Optional[str]=None) -> Optional[Response]:
                 sleep(1 + (2 ** retries))
                 retries = retries + 1
         except ConnectionError:
+            logger.warning(f"{msg} -> connection error")
             sleep(1 + (2 ** retries))
             retries = retries + 1
 
     raise
 
 if __name__ == '__main__':
+    logger.info("Starting up...")
     old_etags = read_etags()
 
     etag = None
@@ -185,7 +200,7 @@ if __name__ == '__main__':
 
     response = get_with_backoff(base_url, etag)
     if response is None:
-        exit(0)
+        exit()
 
     base_etag = response.headers['Etag']
     last_mod = response.headers['Last-Modified']
@@ -206,5 +221,3 @@ if __name__ == '__main__':
     for article in articles:
         new_etags.append(article)
     write_etags(new_etags)
-
-    exit(0)
